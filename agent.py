@@ -810,12 +810,19 @@ async def stream_agent(query: str):
         yield json.dumps({"type": "log", "message": f"⚙️ Đã nạp {len(tools)} công cụ (category: {category})"}) + "\n"
         
         final_response = ""
+        total_in = 0
+        total_out = 0
         async for chunk in agent.astream({"messages": [("human", query)]}):
             if "agent" in chunk:
                 msg = chunk["agent"]["messages"][0]
+                if hasattr(msg, "usage_metadata") and msg.usage_metadata:
+                    total_in += msg.usage_metadata.get("input_tokens", 0)
+                    total_out += msg.usage_metadata.get("output_tokens", 0)
+                    
                 if hasattr(msg, "tool_calls") and msg.tool_calls:
                     for tc in msg.tool_calls:
-                        yield json.dumps({"type": "log", "message": f"⚡ Đang chạy: {tc['name']}..."}) + "\n"
+                        args_str = json.dumps(tc.get('args', {}), ensure_ascii=False, indent=2)
+                        yield json.dumps({"type": "log", "message": f"⚡ Đang chạy: {tc['name']}\nTham số:\n{args_str}"}) + "\n"
                 elif msg.content:
                     if isinstance(msg.content, list):
                         final_response = "\n".join([c.get("text", "") for c in msg.content if isinstance(c, dict) and c.get("type") == "text"])
@@ -823,7 +830,17 @@ async def stream_agent(query: str):
                         final_response = str(msg.content)
             elif "tools" in chunk:
                 for msg in chunk["tools"]["messages"]:
-                    yield json.dumps({"type": "log", "message": f"✅ Hoàn tất công cụ: {msg.name}"}) + "\n"
+                    res_snippet = str(msg.content)
+                    if len(res_snippet) > 500:
+                        res_snippet = res_snippet[:500] + "\n... (đã cắt bớt)"
+                    yield json.dumps({"type": "log", "message": f"✅ Hoàn tất công cụ: {msg.name}\nKết quả:\n{res_snippet}"}) + "\n"
+        
+        if total_in > 0 or total_out > 0:
+            # Pricing for gpt-4o-mini: $0.150/1M input, $0.600/1M output
+            cost = (total_in / 1_000_000 * 0.15) + (total_out / 1_000_000 * 0.60)
+            yield json.dumps({"type": "log", "message": f"💰 Tổng token đã dùng: {total_in + total_out} (Input: {total_in}, Output: {total_out}) - Chi phí: ~${cost:.5f}"}) + "\n"
+            yield json.dumps({"type": "usage", "tokens": total_in + total_out, "cost": cost}) + "\n"
+                    
                     
         yield json.dumps({"type": "message", "content": final_response}) + "\n"
     except Exception as e:

@@ -16,8 +16,13 @@
                 <span class="logo-icon">📊</span>
                 <h1>Superset<span>Agent</span></h1>
             </div>
-            <div class="status">
-                <span class="status-dot"></span> Online
+            <div class="header-right" style="display: flex; gap: 15px; align-items: center;">
+                <div class="session-stats" id="session-stats" style="font-size: 13px; color: var(--text-muted); background: rgba(255, 255, 255, 0.05); padding: 6px 12px; border-radius: 20px;">
+                    Tokens: <span id="token-count" style="color: var(--text-main); font-weight: 500;">0</span> | Chi phí: <span id="session-cost" style="color: #10b981; font-weight: 500;">$0.00000</span>
+                </div>
+                <div class="status">
+                    <span class="status-dot"></span> Online
+                </div>
             </div>
         </header>
 

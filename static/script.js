@@ -3,6 +3,9 @@ const userInput = document.getElementById('user-input');
 const chatContainer = document.getElementById('chat-container');
 const typingIndicator = document.getElementById('typing-indicator');
 
+let sessionTokens = 0;
+let sessionCost = 0.0;
+
 function addMessage(text, isUser = false) {
     if (text === null || text === undefined) text = "";
     text = String(text);
@@ -66,13 +69,15 @@ chatForm.addEventListener('submit', async (e) => {
         chatContainer.appendChild(logContainer);
 
         let finalMessage = "";
+        let buffer = "";
 
         while (true) {
             const { done, value } = await reader.read();
             if (done) break;
             
-            const chunk = decoder.decode(value, { stream: true });
-            const lines = chunk.split('\n');
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop(); // keep the last incomplete line in the buffer
             
             for (const line of lines) {
                 if (!line.trim()) continue;
@@ -86,10 +91,28 @@ chatForm.addEventListener('submit', async (e) => {
                         chatContainer.scrollTo({ top: chatContainer.scrollHeight, behavior: 'smooth' });
                     } else if (data.type === 'message') {
                         finalMessage = data.content;
+                    } else if (data.type === 'usage') {
+                        sessionTokens += data.tokens;
+                        sessionCost += data.cost;
+                        document.getElementById('session-stats').style.display = 'block';
+                        document.getElementById('token-count').textContent = sessionTokens.toLocaleString();
+                        document.getElementById('session-cost').textContent = '$' + sessionCost.toFixed(5);
                     }
                 } catch(e) {
                     console.error("JSON parse error on line:", line, e);
                 }
+            }
+        }
+        
+        // Process any remaining data in the buffer
+        if (buffer.trim()) {
+            try {
+                const data = JSON.parse(buffer);
+                if (data.type === 'message') {
+                    finalMessage = data.content;
+                }
+            } catch(e) {
+                console.error("JSON parse error on final buffer:", buffer, e);
             }
         }
         
