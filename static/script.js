@@ -76,7 +76,7 @@ chatForm.addEventListener('submit', async (e) => {
             if (done) break;
             
             buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
+            const lines = buffer.split('\0');
             buffer = lines.pop(); // keep the last incomplete line in the buffer
             
             for (const line of lines) {

@@ -797,17 +797,17 @@ async def stream_agent(query: str):
     """Gửi từng luồng sự kiện (tools + kết quả) cho UI dưới dạng NDJSON."""
     try:
         category = await route_query(query)
-        yield json.dumps({"type": "log", "message": f"🤖 Phân loại yêu cầu: {category}"}) + "\n"
+        yield json.dumps({"type": "log", "message": f"🤖 Phân loại yêu cầu: {category}"}) + "\0"
         
         if category == "chat":
-            yield json.dumps({"type": "log", "message": f"💬 Trả lời trực tiếp..."}) + "\n"
+            yield json.dumps({"type": "log", "message": f"💬 Trả lời trực tiếp..."}) + "\0"
             response = await handle_chat(query)
-            yield json.dumps({"type": "message", "content": response}) + "\n"
+            yield json.dumps({"type": "message", "content": response}) + "\0"
             return
             
         agent = await get_or_create_agent(category)
         tools = get_tools_for_category(category)
-        yield json.dumps({"type": "log", "message": f"⚙️ Đã nạp {len(tools)} công cụ (category: {category})"}) + "\n"
+        yield json.dumps({"type": "log", "message": f"⚙️ Đã nạp {len(tools)} công cụ (category: {category})"}) + "\0"
         
         final_response = ""
         total_in = 0
@@ -822,7 +822,7 @@ async def stream_agent(query: str):
                 if hasattr(msg, "tool_calls") and msg.tool_calls:
                     for tc in msg.tool_calls:
                         args_str = json.dumps(tc.get('args', {}), ensure_ascii=False, indent=2)
-                        yield json.dumps({"type": "log", "message": f"⚡ Đang chạy: {tc['name']}\nTham số:\n{args_str}"}) + "\n"
+                        yield json.dumps({"type": "log", "message": f"⚡ Đang chạy: {tc['name']}\nTham số:\n{args_str}"}) + "\0"
                 elif msg.content:
                     if isinstance(msg.content, list):
                         final_response = "\n".join([c.get("text", "") for c in msg.content if isinstance(c, dict) and c.get("type") == "text"])
@@ -833,21 +833,21 @@ async def stream_agent(query: str):
                     res_snippet = str(msg.content)
                     if len(res_snippet) > 500:
                         res_snippet = res_snippet[:500] + "\n... (đã cắt bớt)"
-                    yield json.dumps({"type": "log", "message": f"✅ Hoàn tất công cụ: {msg.name}\nKết quả:\n{res_snippet}"}) + "\n"
+                    yield json.dumps({"type": "log", "message": f"✅ Hoàn tất công cụ: {msg.name}\nKết quả:\n{res_snippet}"}) + "\0"
         
         if total_in > 0 or total_out > 0:
             # Pricing for gpt-4o-mini: $0.150/1M input, $0.600/1M output
             cost = (total_in / 1_000_000 * 0.15) + (total_out / 1_000_000 * 0.60)
-            yield json.dumps({"type": "log", "message": f"💰 Tổng token đã dùng: {total_in + total_out} (Input: {total_in}, Output: {total_out}) - Chi phí: ~${cost:.5f}"}) + "\n"
-            yield json.dumps({"type": "usage", "tokens": total_in + total_out, "cost": cost}) + "\n"
+            yield json.dumps({"type": "log", "message": f"💰 Tổng token đã dùng: {total_in + total_out} (Input: {total_in}, Output: {total_out}) - Chi phí: ~${cost:.5f}"}) + "\0"
+            yield json.dumps({"type": "usage", "tokens": total_in + total_out, "cost": cost}) + "\0"
                     
                     
-        yield json.dumps({"type": "message", "content": final_response}) + "\n"
+        yield json.dumps({"type": "message", "content": final_response}, ensure_ascii=False) + "\0"
     except Exception as e:
         import traceback
         traceback.print_exc()
-        yield json.dumps({"type": "log", "message": f"❌ Lỗi: {str(e)}"}) + "\n"
-        yield json.dumps({"type": "message", "content": f"Đã có lỗi hệ thống xảy ra: {str(e)}"}) + "\n"
+        yield json.dumps({"type": "log", "message": f"❌ Lỗi: {str(e)}"}) + "\0"
+        yield json.dumps({"type": "message", "content": f"Đã có lỗi hệ thống xảy ra: {str(e)}"}) + "\0"
 
 
 if __name__ == "__main__":
