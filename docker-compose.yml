@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  agent:
+    build: .
+    container_name: dbhub-agent
+    ports:
+      - "8000:8000"
+    environment:
+      # Authentication for the Agent UI/API
+      - AUTH_USERNAME=${AUTH_USERNAME}
+      - AUTH_PASSWORD=${AUTH_PASSWORD}
+      
+      # Model connection (Example: OpenAI or Gemini)
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      
+      # Superset MCP connection
+      - MCP_URL=http://host.docker.internal:5008/mcp
+      - JWT_SECRET=${JWT_SECRET:-dbhub_superset_secret_key_2024}
+      - JWT_ALGORITHM=HS256
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
