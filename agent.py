@@ -30,6 +30,7 @@ load_dotenv(override=True)
 
 MCP_URL = os.getenv("MCP_URL", "http://localhost:5008/mcp")
 SUPERSET_PUBLIC_URL = os.getenv("SUPERSET_PUBLIC_URL", "")
+SYNC_INTERVAL_MINUTES = int(os.getenv("SYNC_INTERVAL_MINUTES", "60"))  # 0 = disable
 
 # Max chars for tool descriptions (saves ~40% context tokens)
 MAX_TOOL_DESC_LEN = 150
@@ -801,70 +802,107 @@ async def get_or_create_agent(category: str):
 # ---------------------------------------------------------------------------
 
 _vector_synced = False
+_knowledge_mtime: float = 0  # track khi nào dataset_knowledge.json thay đổi
 
 
-async def sync_vector_store():
-    """Đồng bộ datasets và dashboards từ Superset vào ChromaDB (chỉ chạy 1 lần)."""
+def _knowledge_file_changed() -> bool:
+    """Check if dataset_knowledge.json was modified since last sync."""
+    global _knowledge_mtime
+    knowledge_path = vector_store.KNOWLEDGE_FILE
+    if not os.path.exists(knowledge_path):
+        return False
+    current_mtime = os.path.getmtime(knowledge_path)
+    if current_mtime > _knowledge_mtime:
+        _knowledge_mtime = current_mtime
+        return True
+    return False
+
+
+async def sync_vector_store(force: bool = False):
+    """Đồng bộ datasets và dashboards từ Superset vào ChromaDB.
+    
+    - force=True: luôn gọi MCP để lấy data mới
+    - force=False: chỉ sync nếu ChromaDB trống hoặc knowledge file thay đổi
+    """
     global _vector_synced
-    if _vector_synced:
+    if _vector_synced and not force:
         return
 
-    # Fast-path: nếu ChromaDB đã có data từ lần chạy trước → dùng luôn, không gọi MCP
     ds_count = vector_store.get_dataset_collection().count()
     db_count = vector_store.get_dashboard_collection().count()
-    if ds_count > 0 and db_count > 0:
+    knowledge_changed = _knowledge_file_changed()
+    
+    # Nếu đã có data VÀ knowledge không đổi VÀ không force → skip
+    if ds_count > 0 and db_count > 0 and not knowledge_changed and not force:
         print(f"[VectorStore] Loaded from disk: {ds_count} datasets, {db_count} dashboards.")
         _vector_synced = True
         return
 
-    print("[VectorStore] Syncing datasets and dashboards...")
+    if knowledge_changed:
+        print("[VectorStore] Knowledge file changed — re-syncing embeddings...")
+    else:
+        print("[VectorStore] Syncing datasets and dashboards...")
 
     # --- Sync Datasets ---
-    list_ds_tool = _tool_cache.get("list_datasets")
-    if list_ds_tool:
-        raw = await list_ds_tool._arun()
-        try:
-            datasets = json.loads(raw)
-            if isinstance(datasets, list):
-                vector_store.sync_datasets(datasets)
-        except json.JSONDecodeError:
-            print(f"[VectorStore] Failed to parse datasets: {raw[:200]}")
-    else:
-        # Fallback: call MCP directly
+    try:
         text = await fetch_all_pages("list_datasets", True, {})
-        try:
-            datasets = json.loads(text)
-            if isinstance(datasets, list):
-                vector_store.sync_datasets(datasets)
-        except json.JSONDecodeError:
-            print(f"[VectorStore] Failed to parse datasets: {text[:200]}")
+        datasets = json.loads(text)
+        if isinstance(datasets, list) and len(datasets) > 0:
+            vector_store.sync_datasets(datasets)
+        else:
+            print("[VectorStore] WARNING: list_datasets returned empty result.")
+    except (json.JSONDecodeError, Exception) as e:
+        print(f"[VectorStore] Failed to sync datasets: {e}")
 
     # --- Sync Dashboards ---
-    list_db_tool = _tool_cache.get("list_dashboards")
-    if list_db_tool:
-        raw = await list_db_tool._arun()
-        try:
-            dashboards = json.loads(raw)
-            if isinstance(dashboards, list):
-                vector_store.sync_dashboards(dashboards)
-        except json.JSONDecodeError:
-            print(f"[VectorStore] Failed to parse dashboards: {raw[:200]}")
-    else:
+    try:
         text = await fetch_all_pages("list_dashboards", True, {})
-        try:
-            dashboards = json.loads(text)
-            if isinstance(dashboards, list):
-                vector_store.sync_dashboards(dashboards)
-        except json.JSONDecodeError:
-            print(f"[VectorStore] Failed to parse dashboards: {text[:200]}")
+        dashboards = json.loads(text)
+        if isinstance(dashboards, list) and len(dashboards) > 0:
+            vector_store.sync_dashboards(dashboards)
+        else:
+            print("[VectorStore] WARNING: list_dashboards returned empty result.")
+    except (json.JSONDecodeError, Exception) as e:
+        print(f"[VectorStore] Failed to sync dashboards: {e}")
 
-    _vector_synced = True
-    print("[VectorStore] Sync completed.")
+    # Chỉ đánh dấu synced nếu ChromaDB thực sự có data
+    final_ds = vector_store.get_dataset_collection().count()
+    final_db = vector_store.get_dashboard_collection().count()
+    if final_ds > 0 and final_db > 0:
+        _vector_synced = True
+        print(f"[VectorStore] Sync completed: {final_ds} datasets, {final_db} dashboards.")
+    else:
+        print(f"[VectorStore] Sync incomplete (datasets={final_ds}, dashboards={final_db}). Will retry next time.")
+
+
+async def _periodic_sync_task():
+    """Background task: sync vector store định kỳ."""
+    if SYNC_INTERVAL_MINUTES <= 0:
+        print("[VectorStore] Periodic sync disabled (SYNC_INTERVAL_MINUTES=0).")
+        return
+    
+    interval = SYNC_INTERVAL_MINUTES * 60
+    print(f"[VectorStore] Periodic sync enabled: every {SYNC_INTERVAL_MINUTES} minutes.")
+    
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            print(f"[VectorStore] Periodic sync triggered...")
+            await sync_vector_store(force=True)
+        except Exception as e:
+            print(f"[VectorStore] Periodic sync failed: {e}")
 
 
 async def init_agent():
-    """Pre-warm: discover tools and create data_query agent."""
+    """Pre-warm: discover tools, sync vector store, start periodic sync, create data_query agent."""
     await discover_all_tools()
+    
+    # Sync vector store ngay khi khởi động
+    await sync_vector_store()
+    
+    # Start periodic sync background task
+    asyncio.create_task(_periodic_sync_task())
+    
     await get_or_create_agent("data_query")
     print("\n[AGENT] Initialized and ready.\n")
 

@@ -1,0 +1,9 @@
+{
+  "datasets": {
+    "fad_age_gender_detailed_report": {
+      "description": "Báo cáo chi tiết hiệu suất quảng cáo Facebook Ads theo độ tuổi (age) và giới tính (gender). Chứa dữ liệu chi phí (spend), lượt hiển thị (impressions), lượt click, CPC, CPM, CTR, reach, frequency, video views, và các chỉ số tương tác (engagement, reactions, comments, shares). Dùng để phân tích chiến dịch marketing, so sánh hiệu quả quảng cáo theo nhóm tuổi và giới tính.",
+      "keywords": ["facebook ads", "quảng cáo", "chi phí", "spend", "tuổi", "age", "giới tính", "gender", "campaign", "chiến dịch", "marketing", "impressions", "clicks", "cpc", "cpm", "ctr"]
+    }
+  },
+  "dashboards": {}
+}
