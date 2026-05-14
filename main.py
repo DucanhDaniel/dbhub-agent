@@ -13,9 +13,13 @@ import os
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Pre-warm: discover tools + create browse agent at startup."""
+    """Pre-warm: discover tools + create agent at startup."""
     await init_agent()
     yield
+    # Cleanup persistent HTTP client on shutdown
+    from agent import _http_client
+    if _http_client and not _http_client.is_closed:
+        await _http_client.aclose()
 
 
 security = HTTPBasic()

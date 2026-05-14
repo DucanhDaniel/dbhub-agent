@@ -10,3 +10,6 @@ wheels/
 .venv
 
 .env
+
+# ChromaDB persistent storage
+chroma_db/

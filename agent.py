@@ -22,6 +22,9 @@ from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel, Field, create_model
 from dotenv import load_dotenv
 
+import vector_store
+from langchain_core.tools import tool
+
 warnings.filterwarnings("ignore")
 load_dotenv(override=True)
 
@@ -125,28 +128,52 @@ def find_result_event(events: list[dict]) -> tuple[dict, list[str]]:
 
 _mcp_lock = asyncio.Lock()
 
+# Persistent HTTP client — reuse TCP connections (keep-alive)
+_http_client: httpx.AsyncClient | None = None
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    """Lazy-init a persistent httpx client with connection pooling."""
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                connect=10.0,     # max time to establish TCP connection
+                read=120.0,       # max time to wait for response data
+                write=30.0,       # max time to send request data
+                pool=10.0,        # max time to wait for a connection from the pool
+            ),
+            limits=httpx.Limits(
+                max_connections=20,           # total connections in the pool
+                max_keepalive_connections=5,   # keep-alive connections
+                keepalive_expiry=30.0,         # keep connections alive for 30s
+            ),
+        )
+    return _http_client
+
+
 async def call_mcp(method: str, params: dict) -> tuple[dict, list[str]]:
     max_retries = 3
     base_delay = 2.0
     
     async with _mcp_lock:
         token = _generate_jwt_token()
+        client = _get_http_client()
         
         for attempt in range(max_retries):
             try:
-                async with httpx.AsyncClient(timeout=60.0) as client:
-                    payload = {"jsonrpc": "2.0", "id": "1", "method": method, "params": params}
-                    headers = {
-                        "Content-Type": "application/json",
-                        "Accept": "application/json, text/event-stream",
-                        "Authorization": f"Bearer {token}",
-                    }
-                    response = await client.post(MCP_URL, json=payload, headers=headers)
-                    events = parse_sse_events(response.text)
-                    result, notifications = find_result_event(events)
-                    if not result:
-                        print(f"  [WARNING] No result. Raw: {response.text[:200]}")
-                    return result, notifications
+                payload = {"jsonrpc": "2.0", "id": "1", "method": method, "params": params}
+                headers = {
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/event-stream",
+                    "Authorization": f"Bearer {token}",
+                }
+                response = await client.post(MCP_URL, json=payload, headers=headers)
+                events = parse_sse_events(response.text)
+                result, notifications = find_result_event(events)
+                if not result:
+                    print(f"  [WARNING] No result. Raw: {response.text[:200]}")
+                return result, notifications
             except Exception as e:
                 print(f"  [ERROR] Lần thử {attempt + 1}/{max_retries} thất bại: {e}")
                 if attempt < max_retries - 1:
@@ -436,6 +463,39 @@ def trim_description(desc: str, max_len: int = MAX_TOOL_DESC_LEN) -> str:
     return truncated.rstrip() + "..."
 
 
+# Max chars for tool output sent to LLM (saves input tokens)
+MAX_TOOL_OUTPUT_LEN = 4000
+
+
+def _truncate_tool_output(tool_name: str, text: str) -> str:
+    """Cắt bớt output của tool trước khi gửi cho LLM để tiết kiệm token."""
+    if not text or len(text) <= MAX_TOOL_OUTPUT_LEN:
+        return text
+    
+    # Đặc biệt cho get_dataset_info: chỉ giữ columns/metrics, bỏ description dài
+    if tool_name in ("get_dataset_info", "get_dashboard_info"):
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                # Cắt description nếu quá dài
+                desc = data.get("description", "")
+                if desc and len(desc) > 200:
+                    data["description"] = desc[:200] + "... (truncated)"
+                # Cắt CSS/certified fields
+                for key in ["css", "certification_details"]:
+                    if key in data and data[key] and len(str(data[key])) > 100:
+                        data[key] = "(truncated)"
+                trimmed = json.dumps(data, ensure_ascii=False, indent=2)
+                if len(trimmed) <= MAX_TOOL_OUTPUT_LEN:
+                    return trimmed
+                # Vẫn quá dài → cắt thêm
+                return trimmed[:MAX_TOOL_OUTPUT_LEN] + "\n... (output truncated)"
+        except (json.JSONDecodeError, TypeError):
+            pass
+    
+    return text[:MAX_TOOL_OUTPUT_LEN] + "\n... (output truncated)"
+
+
 def make_mcp_tool(tool_def: dict) -> BaseTool:
     tool_name = tool_def["name"]
     raw_desc = tool_def.get("description", tool_name).strip()
@@ -517,6 +577,9 @@ def make_mcp_tool(tool_def: dict) -> BaseTool:
             if is_cacheable and text and not text.startswith("Tool '"):
                 _data_cache[cache_key] = text
 
+            # Truncate trước khi gửi cho LLM để tiết kiệm input tokens
+            text = _truncate_tool_output(self.name, text)
+
             print(f"<<< [{self.name}] {text[:300]}")
             return text or f"Tool '{self.name}' returned empty result."
 
@@ -532,27 +595,18 @@ def make_mcp_tool(tool_def: dict) -> BaseTool:
 
 # Phân nhóm tool theo intent category
 TOOL_CATEGORIES = {
-    "browse": {
-        "tools": ["list_datasets", "list_charts", "list_dashboards", "list_databases",
-                   "get_dataset_info", "get_chart_info", "get_dashboard_info", "get_database_info"],
-        "search_queries": ["dataset", "chart", "dashboard", "database"],
+    "data_query": {
+        "tools": ["search_dataset_vector", "list_datasets", "get_dataset_info", "execute_sql", "save_sql_query", "create_virtual_dataset", "list_databases"],
+        "search_queries": ["dataset", "sql", "query", "database"],
     },
-    "chart": {
-        "tools": ["list_datasets", "get_dataset_info", "get_chart_type_schema",
-                   "generate_chart", "generate_explore_link", "update_chart",
-                   "get_chart_data", "get_chart_preview", "get_chart_sql", "update_chart_preview"],
-        "search_queries": ["dataset", "chart", "schema"],
+    "dashboard_query": {
+        "tools": ["search_dashboard_vector", "list_dashboards", "list_charts", "get_dashboard_info", "get_chart_info", "query_dataset"],
+        "search_queries": ["dashboard", "chart", "list", "query"],
     },
-    "dashboard": {
-        "tools": ["list_charts", "list_dashboards", "get_dashboard_info",
-                   "generate_dashboard", "add_chart_to_existing_dashboard",
-                   "generate_chart", "list_datasets", "get_dataset_info", "get_chart_type_schema"],
-        "search_queries": ["dashboard", "chart", "dataset", "schema"],
-    },
-    "sql": {
-        "tools": ["list_databases", "get_database_info", "list_datasets", "get_dataset_info",
-                   "execute_sql", "save_sql_query", "open_sql_lab_with_context", "create_virtual_dataset"],
-        "search_queries": ["sql", "database", "query", "dataset"],
+    "build": {
+        "tools": ["search_dataset_vector", "list_datasets", "get_dataset_info", "get_chart_type_schema", 
+                  "generate_chart", "add_chart_to_existing_dashboard", "generate_dashboard"],
+        "search_queries": ["dataset", "chart", "schema", "dashboard"],
     },
     "system": {
         "tools": ["health_check", "get_instance_info", "get_schema", "generate_bug_report"],
@@ -560,9 +614,28 @@ TOOL_CATEGORIES = {
     },
 }
 
+@tool
+def search_dataset_vector(query: str, n_results: int = 3) -> str:
+    """Searches the vector database for datasets matching the semantic query. Returns dataset IDs and metadata. Use this before fetching dataset info."""
+    results = vector_store.search_dataset(query, n_results)
+    if not results:
+        return "No datasets found."
+    return json.dumps(results, ensure_ascii=False, indent=2)
+
+@tool
+def search_dashboard_vector(query: str, n_results: int = 3) -> str:
+    """Searches the vector database for dashboards matching the semantic query. Returns dashboard IDs and metadata. Use this before fetching dashboard info."""
+    results = vector_store.search_dashboard(query, n_results)
+    if not results:
+        return "No dashboards found."
+    return json.dumps(results, ensure_ascii=False, indent=2)
+
 # Cache tool definitions globally
 _all_tool_defs: dict[str, dict] = {}  # name -> tool_def
-_tool_cache: dict[str, BaseTool] = {}  # name -> BaseTool instance
+_tool_cache: dict[str, BaseTool] = {
+    "search_dataset_vector": search_dataset_vector,
+    "search_dashboard_vector": search_dashboard_vector
+}
 
 
 async def discover_all_tools() -> None:
@@ -599,7 +672,7 @@ async def discover_all_tools() -> None:
 
 def get_tools_for_category(category: str) -> list[BaseTool]:
     """Lấy subset tools cho một category, dùng cache."""
-    cat_config = TOOL_CATEGORIES.get(category, TOOL_CATEGORIES["browse"])
+    cat_config = TOOL_CATEGORIES.get(category, TOOL_CATEGORIES["data_query"])
     needed_names = cat_config["tools"]
 
     tools = []
@@ -624,12 +697,11 @@ _router_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, max_tokens=100)
 ROUTER_PROMPT = """Classify the user query into exactly ONE category. Reply with ONLY the category name.
 
 Categories:
-- browse: listing, viewing, searching datasets/charts/dashboards/databases
-- chart: creating, updating, previewing charts or visualizations
-- dashboard: creating dashboards, adding charts to dashboards
-- sql: executing SQL, saving queries, SQL Lab
-- system: health check, instance info, schema discovery, bug reports
-- chat: general conversation, greetings, questions not about Superset data
+- data_query: asking for data, searching datasets, querying SQL, analyzing data.
+- dashboard_query: asking for existing dashboards or charts, viewing dashboard information.
+- build: creating or designing new charts and dashboards.
+- system: health check, instance info, schema discovery, bug reports.
+- chat: general conversation, greetings, questions not about Superset data.
 
 Query: {query}
 Category:"""
@@ -644,22 +716,29 @@ async def route_query(query: str) -> str:
     # Normalize
     valid = set(TOOL_CATEGORIES.keys()) | {"chat"}
     if category not in valid:
-        category = "browse"  # fallback
+        category = "data_query"  # fallback
     print(f"[ROUTER] '{query[:50]}...' -> {category}")
     return category
 
 
 # System prompts — compact, per-category
 EXECUTOR_PROMPTS = {
-    "browse": (
-        "You are a Superset assistant. Use tools to list/view datasets, charts, dashboards, databases.\n"
+    "data_query": (
+        "You are a Superset Data Assistant.\n"
+        "Workflow: search_dataset_vector -> get_dataset_info -> execute_sql -> analyze data.\n"
+        "MANDATORY: ALWAYS call search_dataset_vector to find datasets. Then use get_dataset_info to learn the dataset schema before writing SQL.\n"
         "Respond in the user's language. Never fabricate data."
     ),
-    "chart": (
-        "You are a Superset chart builder.\n"
-        "MANDATORY: ALWAYS call get_dataset_info FIRST to learn the dataset schema (columns, types, metrics) before any chart operation.\n"
-        "Workflow: get_dataset_info → get_chart_type_schema(include_examples=true) → generate_chart.\n"
-        "ColumnRef: {\"name\":\"col\",\"aggregate\":\"SUM\"} or {\"name\":\"metric\",\"saved_metric\":true}.\n"
+    "dashboard_query": (
+        "You are a Superset Dashboard Assistant.\n"
+        "Workflow: search_dashboard_vector -> get_dashboard_info -> get_chart_data for charts inside it.\n"
+        "MANDATORY: ALWAYS call search_dashboard_vector to find the dashboard ID first.\n"
+        "Respond in the user's language. Never fabricate data."
+    ),
+    "build": (
+        "You are a Superset Dashboard & Chart Builder.\n"
+        "Workflow: search_dataset_vector -> get_dataset_info -> get_chart_type_schema -> generate_chart -> add_chart_to_existing_dashboard / generate_dashboard.\n"
+        "MANDATORY: ALWAYS call search_dataset_vector and get_dataset_info FIRST to learn the dataset schema before any chart operation.\n"
         "CRITICAL CHART SCHEMA RULES:\n"
         "1. Allowed chart_types: 'xy', 'table', 'pie', 'pivot_table', 'mixed_timeseries', 'handlebars', 'big_number'.\n"
         "2. For bar or line charts, use chart_type='xy' and set kind='bar' or kind='line' inside config. NEVER use 'bar'/'line' as chart_type!\n"
@@ -667,29 +746,6 @@ EXECUTOR_PROMPTS = {
         "4. 'pie' and 'big_number' use 'metric' (singular, dict), NOT 'metrics' (plural).\n"
         "5. 'table' does not use 'metric'/'metrics'. Use 'columns', 'groupby', 'query_mode'.\n"
         "6. 'chart_name' MUST be TOP-LEVEL, outside of the 'config' dict.\n"
-        "7. Use snake_case for config keys ('chart_type', not 'chartType').\n"
-        "Quick xy: {\"chart_type\":\"xy\",\"kind\":\"line\",\"x\":{\"name\":\"date\"},\"y\":[{\"name\":\"val\",\"aggregate\":\"SUM\"}]}\n"
-        "Respond in the user's language."
-    ),
-    "dashboard": (
-        "You are a Superset dashboard builder.\n"
-        "MANDATORY: ALWAYS call get_dataset_info FIRST to learn the dataset schema (columns, types, metrics) before creating charts.\n"
-        "Workflow: get_dataset_info → generate_chart(save_chart=true) for each chart → generate_dashboard(chart_ids=[...]).\n"
-        "CRITICAL CHART SCHEMA RULES:\n"
-        "1. Allowed chart_types: 'xy', 'table', 'pie', 'pivot_table', 'mixed_timeseries', 'handlebars', 'big_number'.\n"
-        "2. For bar or line charts, use chart_type='xy' and set kind='bar' or kind='line' inside config. NEVER use 'bar'/'line' as chart_type!\n"
-        "3. For xy charts, ALWAYS use 'x' (dict) and 'y' (list of dicts) for axes. NEVER use 'x_axis' or 'y_axis'.\n"
-        "4. 'pie' and 'big_number' use 'metric' (singular, dict), NOT 'metrics' (plural).\n"
-        "5. 'table' does not use 'metric'/'metrics'. Use 'columns', 'groupby', 'query_mode'.\n"
-        "6. 'chart_name' MUST be TOP-LEVEL, outside of the 'config' dict.\n"
-        "7. Use snake_case for config keys ('chart_type', not 'chartType').\n"
-        "Call get_chart_type_schema before generate_chart if unsure about config format.\n"
-        "Respond in the user's language."
-    ),
-    "sql": (
-        "You are a Superset SQL assistant.\n"
-        "MANDATORY: ALWAYS call get_dataset_info FIRST to learn the dataset schema (columns, types) before writing or executing SQL.\n"
-        "Use execute_sql to run queries, save_sql_query to save, create_virtual_dataset to make chartable datasets.\n"
         "Respond in the user's language."
     ),
     "system": (
@@ -726,7 +782,7 @@ async def get_or_create_agent(category: str):
     if not tools:
         raise RuntimeError(f"No tools found for category '{category}'")
 
-    prompt = EXECUTOR_PROMPTS.get(category, EXECUTOR_PROMPTS["browse"])
+    prompt = EXECUTOR_PROMPTS.get(category, EXECUTOR_PROMPTS["data_query"])
 
     # Executor model — có thể dùng model xịn hơn ở đây
     executor_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
@@ -743,20 +799,72 @@ async def get_or_create_agent(category: str):
 # Public API
 # ---------------------------------------------------------------------------
 
+_vector_synced = False
+
+
+async def sync_vector_store():
+    """Đồng bộ datasets và dashboards từ Superset vào ChromaDB (chỉ chạy 1 lần)."""
+    global _vector_synced
+    if _vector_synced:
+        return
+
+    # Fast-path: nếu ChromaDB đã có data từ lần chạy trước → dùng luôn, không gọi MCP
+    ds_count = vector_store.get_dataset_collection().count()
+    db_count = vector_store.get_dashboard_collection().count()
+    if ds_count > 0 and db_count > 0:
+        print(f"[VectorStore] Loaded from disk: {ds_count} datasets, {db_count} dashboards.")
+        _vector_synced = True
+        return
+
+    print("[VectorStore] Syncing datasets and dashboards...")
+
+    # --- Sync Datasets ---
+    list_ds_tool = _tool_cache.get("list_datasets")
+    if list_ds_tool:
+        raw = await list_ds_tool._arun()
+        try:
+            datasets = json.loads(raw)
+            if isinstance(datasets, list):
+                vector_store.sync_datasets(datasets)
+        except json.JSONDecodeError:
+            print(f"[VectorStore] Failed to parse datasets: {raw[:200]}")
+    else:
+        # Fallback: call MCP directly
+        text = await fetch_all_pages("list_datasets", True, {})
+        try:
+            datasets = json.loads(text)
+            if isinstance(datasets, list):
+                vector_store.sync_datasets(datasets)
+        except json.JSONDecodeError:
+            print(f"[VectorStore] Failed to parse datasets: {text[:200]}")
+
+    # --- Sync Dashboards ---
+    list_db_tool = _tool_cache.get("list_dashboards")
+    if list_db_tool:
+        raw = await list_db_tool._arun()
+        try:
+            dashboards = json.loads(raw)
+            if isinstance(dashboards, list):
+                vector_store.sync_dashboards(dashboards)
+        except json.JSONDecodeError:
+            print(f"[VectorStore] Failed to parse dashboards: {raw[:200]}")
+    else:
+        text = await fetch_all_pages("list_dashboards", True, {})
+        try:
+            dashboards = json.loads(text)
+            if isinstance(dashboards, list):
+                vector_store.sync_dashboards(dashboards)
+        except json.JSONDecodeError:
+            print(f"[VectorStore] Failed to parse dashboards: {text[:200]}")
+
+    _vector_synced = True
+    print("[VectorStore] Sync completed.")
+
+
 async def init_agent():
-    """Pre-warm: discover tools and create browse agent."""
+    """Pre-warm: discover tools and create data_query agent."""
     await discover_all_tools()
-    await get_or_create_agent("browse")
-    
-    print("\n[AGENT] Pre-warming cache for list tools...")
-    tools_to_warm = ["list_datasets", "list_charts", "list_dashboards", "list_databases"]
-    for t_name in tools_to_warm:
-        tool = _tool_cache.get(t_name)
-        if tool:
-            print(f"  -> Warming up {t_name}...")
-            # Run without arguments to populate cache
-            await tool._arun()
-            
+    await get_or_create_agent("data_query")
     print("\n[AGENT] Initialized and ready.\n")
 
 
@@ -804,6 +912,12 @@ async def stream_agent(query: str):
             response = await handle_chat(query)
             yield json.dumps({"type": "message", "content": response}) + "\0"
             return
+
+        # Lazy-sync vector store on first non-chat request
+        if not _vector_synced:
+            yield json.dumps({"type": "log", "message": "🔄 Đang đồng bộ dữ liệu vào Vector DB (lần đầu)..."}) + "\0"
+            await sync_vector_store()
+            yield json.dumps({"type": "log", "message": "✅ Đồng bộ Vector DB hoàn tất."}) + "\0"
             
         agent = await get_or_create_agent(category)
         tools = get_tools_for_category(category)
@@ -854,19 +968,22 @@ if __name__ == "__main__":
     async def main():
         await init_agent()
 
-        # Test router
+        # Test router with new categories
         for q in [
             "Xin chào!",
-            "Tôi có những dataset nào?",
-            "Vẽ chart big_number cho dataset 27",
-            "Tạo dashboard từ các chart",
-            "Chạy SQL SELECT * FROM users",
+            "Dữ liệu marketing có gì?",
+            "Dashboard nào liên quan đến doanh thu?",
+            "Tạo chart bar cho doanh thu theo tháng",
+            "Tạo dashboard tổng hợp",
         ]:
             cat = await route_query(q)
             print(f"  -> {cat}\n")
 
-        # Test full flow
-        answer = await ask_agent("Tôi đang có những bộ dataset nào?")
-        print(f"\n{'='*60}\nKẾT QUẢ:\n{answer}")
+        # Test vector sync
+        await sync_vector_store()
+        
+        # Test vector search
+        results = vector_store.search_dataset("marketing")
+        print(f"\n[TEST] Vector search 'marketing': {json.dumps(results, indent=2)}")
 
     asyncio.run(main())
