@@ -17,11 +17,18 @@ function addMessage(text, isUser = false) {
     const messageDiv = document.createElement('div');
     messageDiv.className = `message ${isUser ? 'user' : 'agent'}`;
     
-    // Simple markdown-like replacement for bold and code blocks
-    let formattedText = text
-        .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-        .replace(/```([\s\S]*?)```/g, '<pre><code>$1</code></pre>')
-        .replace(/\n/g, '<br>');
+    // Render full markdown using marked.js
+    const renderer = new marked.Renderer();
+    // Links open in new tab
+    renderer.link = function(href, title, text) {
+        // marked v14+ passes an object; older versions pass positional args
+        if (typeof href === 'object') {
+            const token = href;
+            return `<a href="${token.href}" target="_blank" rel="noopener">${token.text}</a>`;
+        }
+        return `<a href="${href}" target="_blank" rel="noopener">${text}</a>`;
+    };
+    let formattedText = marked.parse(text, { renderer, breaks: true });
 
     messageDiv.innerHTML = formattedText;
     chatContainer.appendChild(messageDiv);

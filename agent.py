@@ -29,6 +29,7 @@ warnings.filterwarnings("ignore")
 load_dotenv(override=True)
 
 MCP_URL = os.getenv("MCP_URL", "http://localhost:5008/mcp")
+SUPERSET_PUBLIC_URL = os.getenv("SUPERSET_PUBLIC_URL", "")
 
 # Max chars for tool descriptions (saves ~40% context tokens)
 MAX_TOOL_DESC_LEN = 150
@@ -956,6 +957,15 @@ async def stream_agent(query: str):
             yield json.dumps({"type": "usage", "tokens": total_in + total_out, "cost": cost}) + "\0"
                     
                     
+        # Rewrite internal Superset URLs to public domain
+        if SUPERSET_PUBLIC_URL and final_response:
+            import re
+            final_response = re.sub(
+                r'https?://localhost(:\d+)?',
+                SUPERSET_PUBLIC_URL.rstrip('/'),
+                final_response
+            )
+
         yield json.dumps({"type": "message", "content": final_response}, ensure_ascii=False) + "\0"
     except Exception as e:
         import traceback
