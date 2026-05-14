@@ -362,6 +362,21 @@ def coerce_args(kwargs: dict, properties: dict) -> dict:
         if "chartType" in cfg:
             cfg["chart_type"] = cfg.pop("chartType")
             print("  [COERCE] config.chartType -> config.chart_type")
+        
+        # Auto-infer chart_type if LLM completely omits it
+        if "chart_type" not in cfg:
+            if "x" in cfg and "y" in cfg:
+                cfg["chart_type"] = "xy"
+                print("  [COERCE] Inferred chart_type='xy' from x/y keys")
+            elif "metric" in cfg and "dimension" in cfg:
+                cfg["chart_type"] = "pie"
+                print("  [COERCE] Inferred chart_type='pie' from metric/dimension keys")
+            elif "columns" in cfg or "query_mode" in cfg:
+                cfg["chart_type"] = "table"
+                print("  [COERCE] Inferred chart_type='table' from columns/query_mode keys")
+            elif "metric" in cfg and "dimension" not in cfg:
+                cfg["chart_type"] = "big_number"
+                print("  [COERCE] Inferred chart_type='big_number' from metric-only config")
             
         if "filters" in cfg and isinstance(cfg["filters"], list):
             for f in cfg["filters"]:
@@ -742,12 +757,14 @@ EXECUTOR_PROMPTS = {
         "Workflow: search_dataset_vector -> get_dataset_info -> get_chart_type_schema -> generate_chart -> add_chart_to_existing_dashboard / generate_dashboard.\n"
         "MANDATORY: ALWAYS call search_dataset_vector and get_dataset_info FIRST to learn the dataset schema before any chart operation.\n"
         "CRITICAL CHART SCHEMA RULES:\n"
+        "0. ⚠️ 'chart_type' MUST be INSIDE the 'config' dict! Example: config={\"chart_type\": \"xy\", \"x\": {...}, ...}. Without this, the chart WILL FAIL.\n"
         "1. Allowed chart_types: 'xy', 'table', 'pie', 'pivot_table', 'mixed_timeseries', 'handlebars', 'big_number'.\n"
         "2. For bar or line charts, use chart_type='xy' and set kind='bar' or kind='line' inside config. NEVER use 'bar'/'line' as chart_type!\n"
         "3. For xy charts, ALWAYS use 'x' (dict) and 'y' (list of dicts) for axes. NEVER use 'x_axis' or 'y_axis'.\n"
         "4. 'pie' and 'big_number' use 'metric' (singular, dict), NOT 'metrics' (plural).\n"
         "5. 'table' does not use 'metric'/'metrics'. Use 'columns', 'groupby', 'query_mode'.\n"
         "6. 'chart_name' MUST be TOP-LEVEL, outside of the 'config' dict.\n"
+        "7. Use get_chart_type_schema to get the EXACT required fields for each chart_type BEFORE calling generate_chart.\n"
         "Respond in the user's language."
     ),
     "system": (
@@ -998,11 +1015,14 @@ async def stream_agent(query: str):
         # Rewrite internal Superset URLs to public domain
         if SUPERSET_PUBLIC_URL and final_response:
             import re
+            original = final_response
             final_response = re.sub(
                 r'https?://localhost(:\d+)?',
                 SUPERSET_PUBLIC_URL.rstrip('/'),
                 final_response
             )
+            if final_response != original:
+                print(f"[URL-REWRITE] Replaced localhost URLs → {SUPERSET_PUBLIC_URL}")
 
         yield json.dumps({"type": "message", "content": final_response}, ensure_ascii=False) + "\0"
     except Exception as e:
